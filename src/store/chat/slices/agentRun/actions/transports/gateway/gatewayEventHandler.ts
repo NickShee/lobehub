@@ -1,4 +1,6 @@
 import type {
+  AgentInterventionRequestData,
+  AgentInterventionResponseData,
   AgentStreamEvent,
   StepCompleteData,
   StreamChunkData,
@@ -17,6 +19,7 @@ import type {
 } from '@lobechat/types';
 import { AgentRuntimeErrorType } from '@lobechat/types';
 import { isRecord, pickNonEmptyString, toRecord } from '@lobechat/utils/object';
+import { throttle } from 'es-toolkit/compat';
 
 import { messageService } from '@/services/message';
 import { didToolMutateWorkView, workService } from '@/services/work';
@@ -26,6 +29,7 @@ import type {
   RunScope,
 } from '@/store/chat/slices/agentRun/actions/lifecycle/types';
 import { dbMessageSelectors } from '@/store/chat/slices/message/selectors';
+import { operationSelectors } from '@/store/chat/slices/operation/selectors';
 import type { ChatStore } from '@/store/chat/store';
 import { notifyDesktopHumanApprovalRequired } from '@/store/chat/utils/desktopNotification';
 import { messageMapKey } from '@/store/chat/utils/messageMapKey';
@@ -428,6 +432,27 @@ export const createGatewayEventHandler = (
 
   // Accumulated content from stream chunks (reset on each stream_start)
   let accumulatedContent = '';
+  // Throttle streamed text dispatches. Without this every text chunk re-runs
+  // the whole conversation `parse()` and re-renders the markdown per token; on
+  // long content or long tool chains this saturates the main thread and the UI
+  // freezes while the (independent, async) DB persistence still completes. The
+  // leading edge paints the first token immediately; the trailing edge (plus
+  // the flush in step_complete / agent_runtime_end / error) guarantees the
+  // final accumulated content always reaches the store.
+  const throttledUpdateContent = throttle(
+    () => {
+      get().internal_dispatchMessage(
+        {
+          id: currentAssistantMessageId,
+          type: 'updateMessage',
+          value: { content: accumulatedContent },
+        },
+        dispatchContext,
+      );
+    },
+    120,
+    { leading: true, trailing: true },
+  );
   let accumulatedReasoning = '';
   // Last applied `replace`-snapshot seqs. Operation-monotonic (the producer
   // never resets them across messages), so unlike the accumulators they are
@@ -438,6 +463,7 @@ export const createGatewayEventHandler = (
   const toolStateBootstrapPromiseByCallId = new Map<string, Promise<void>>();
   const lastAppliedToolStateSeqByCallId = new Map<string, number>();
   const completedToolStateCallIds = new Set<string>();
+  const pendingInterventionToolCallIds = new Set<string>();
 
   // Tracks whether any server-confirmed state has actually arrived
   // (server-assigned assistant id, streamed text/reasoning/tools, or a SoT
@@ -478,6 +504,22 @@ export const createGatewayEventHandler = (
   const enqueue = (fn: () => Promise<void> | void): Promise<void> => {
     processingChain = processingChain.then(fn, fn);
     return processingChain;
+  };
+
+  const writeTopicStatus = (status: 'running' | 'waitingForHuman') => {
+    if (!context.topicId) return;
+    const statusWrite = get().updateTopicStatus?.({
+      agentId: context.agentId,
+      groupId: context.groupId,
+      ...(context.scope === 'group' || context.scope === 'group_agent'
+        ? { scope: context.scope }
+        : {}),
+      status,
+      topicId: context.topicId,
+    });
+    void statusWrite?.catch((error) => {
+      console.error('[gatewayEventHandler] updateTopicStatus failed:', error);
+    });
   };
 
   const getToolMessageByCallId = (toolCallId: string): UIChatMessage | undefined => {
@@ -757,14 +799,7 @@ export const createGatewayEventHandler = (
                 accumulatedContent = data.content;
               }
               hasStreamedContent = true;
-              get().internal_dispatchMessage(
-                {
-                  id: currentAssistantMessageId,
-                  type: 'updateMessage',
-                  value: { content: accumulatedContent },
-                },
-                dispatchContext,
-              );
+              throttledUpdateContent();
             }
           }
 
@@ -911,6 +946,83 @@ export const createGatewayEventHandler = (
         break;
       }
 
+      case 'agent_intervention_request': {
+        const data = event.data as AgentInterventionRequestData | undefined;
+        if (!data?.toolCallId) break;
+
+        pendingInterventionToolCallIds.add(data.toolCallId);
+        writeTopicStatus('waitingForHuman');
+        void notifyDesktopHumanApprovalRequired(get, context);
+
+        // Server persistence runs before stream publish. Reconcile from DB so
+        // both the inline tool and global InterventionBar see `pending`, even
+        // when this request raced ahead of the provider's tools_calling event.
+        enqueue(async () => {
+          await fetchAndReplaceMessages(get, context, { skipWorks: true }).catch(console.error);
+          hasStreamedContent = true;
+        });
+        break;
+      }
+
+      case 'agent_intervention_response': {
+        const data = event.data as AgentInterventionResponseData | undefined;
+        if (!data?.toolCallId) break;
+
+        // A modern submit response is a producer-delivery leg, not completion.
+        // Keep the topic/card waiting until the producer echoes producerAck.
+        // Older responses had no request id and remain terminal-compatible.
+        if (data.resolutionRequestId && data.producerAck !== true) {
+          pendingInterventionToolCallIds.add(data.toolCallId);
+          writeTopicStatus('waitingForHuman');
+          enqueue(async () => {
+            const toolMessage = getToolMessageByCallId(data.toolCallId);
+            if (!toolMessage) return;
+            const intervention = {
+              ...toolMessage.pluginIntervention,
+              resolving: true,
+              status: 'pending' as const,
+            };
+
+            // The inline parent tool reads plugin.intervention, while the
+            // global approval collector reads the durable tool row's top-level
+            // pluginIntervention. Update both local projections immediately so
+            // every subscribed surface becomes non-actionable. Do not persist
+            // this subscriber hint: a slow write could overwrite a later
+            // producer-ACK terminal state.
+            get().internal_dispatchMessage(
+              {
+                id: toolMessage.id,
+                type: 'updateMessage',
+                value: { pluginIntervention: intervention },
+              },
+              { context },
+            );
+            if (toolMessage.parentId && toolMessage.tool_call_id) {
+              get().internal_dispatchMessage(
+                {
+                  id: toolMessage.parentId,
+                  tool_call_id: toolMessage.tool_call_id,
+                  type: 'updateMessageTools',
+                  value: { intervention },
+                },
+                { context },
+              );
+            }
+          });
+          break;
+        }
+
+        pendingInterventionToolCallIds.delete(data.toolCallId);
+        enqueue(async () => {
+          // Successful Web submits, explicit cancellation, producer timeout,
+          // and session teardown all converge on the durable tool row before
+          // this refresh. Do not infer the terminal state from identifier.
+          await fetchAndReplaceMessages(get, context, { skipWorks: true }).catch(console.error);
+          if (pendingInterventionToolCallIds.size === 0) writeTopicStatus('running');
+        });
+        break;
+      }
+
       case 'step_start': {
         const data = event.data as {
           pendingToolsCalling?: unknown[];
@@ -945,20 +1057,7 @@ export const createGatewayEventHandler = (
           void notifyDesktopHumanApprovalRequired(get, context);
           // Persist the explicit "needs user input" marker so the sidebar swaps
           // the running spinner for the hand icon across reloads.
-          if (context.topicId) {
-            const statusWrite = get().updateTopicStatus?.({
-              agentId: context.agentId,
-              groupId: context.groupId,
-              ...(context.scope === 'group' || context.scope === 'group_agent'
-                ? { scope: context.scope }
-                : {}),
-              status: 'waitingForHuman',
-              topicId: context.topicId,
-            });
-            void statusWrite?.catch((error) => {
-              console.error('[gatewayEventHandler] updateTopicStatus failed:', error);
-            });
-          }
+          writeTopicStatus('waitingForHuman');
         }
 
         break;
@@ -1022,6 +1121,14 @@ export const createGatewayEventHandler = (
 
       case 'step_complete': {
         const data = event.data as StepCompleteData | undefined;
+        // Ensure the completed step's final content reaches the store even if
+        // its last chunk is still sitting in the throttle's trailing window.
+        // Enqueued so it runs after any stream_chunk work queued ahead of it —
+        // a synchronous burst of events would otherwise flush before the chunks
+        // had been processed.
+        enqueue(() => {
+          throttledUpdateContent.flush();
+        });
 
         // A parked `callSubAgent` child reporting its running totals. Patch them
         // onto the placeholder tool message in memory only — the persisted values
@@ -1104,6 +1211,12 @@ export const createGatewayEventHandler = (
           get().internal_toggleToolCallingStreaming(currentAssistantMessageId, undefined);
           endReasoningIfNeeded();
 
+          // Push the final streamed content into the store and drop any pending
+          // trailing throttle call — otherwise it could fire after the terminal
+          // snapshot/refetch below and overwrite server-finalized content.
+          throttledUpdateContent.flush();
+          throttledUpdateContent.cancel();
+
           // The terminal snapshot, when the server pushed one — the reconciled
           // Source of Truth for this run's final assistant text.
           let terminalMessages: UIChatMessage[] | undefined;
@@ -1115,12 +1228,23 @@ export const createGatewayEventHandler = (
           // pushes the canonical snapshot directly on this event. Fall back
           // to a DB refetch only if the snapshot is absent (older server
           // builds, or push-event delivery edge cases).
+          const isSuperseded = operationSelectors.hasNewerConversationOperation(
+            operationId,
+            context,
+          )(get());
           if (Array.isArray(data?.uiMessages)) {
             terminalMessages = data.uiMessages;
-            get().replaceMessages(data.uiMessages, {
-              action: 'gateway/agent_runtime_end',
-              context,
-            });
+            // `visible_output_end` lets a follow-up start before this terminal
+            // event arrives. Once that happens, this run's snapshot is no longer
+            // the conversation SoT: replacing the list would erase the newer
+            // turn's optimistic rows until refresh. Keep terminalMessages for
+            // this run's notification, but do not mutate its successor's store.
+            if (!isSuperseded) {
+              get().replaceMessages(data.uiMessages, {
+                action: 'gateway/agent_runtime_end',
+                context,
+              });
+            }
           } else if (
             (data?.reason === 'interrupted' || data?.reason === 'waiting_for_async_tool') &&
             hasStreamedContent
@@ -1143,7 +1267,7 @@ export const createGatewayEventHandler = (
             // arrives BEFORE any stream activity, the optimistic `tmp_*`
             // messages are the only in-memory state and they need the
             // refetch to be reconciled with the server-side rows.
-          } else {
+          } else if (!isSuperseded) {
             await fetchAndReplaceMessages(get, context).catch(console.error);
           }
 
@@ -1237,6 +1361,11 @@ export const createGatewayEventHandler = (
 
           get().internal_toggleToolCallingStreaming(currentAssistantMessageId, undefined);
           endReasoningIfNeeded();
+
+          // Flush and drop any pending trailing content update so the last
+          // streamed text lands in the store before the error is applied.
+          throttledUpdateContent.flush();
+          throttledUpdateContent.cancel();
 
           // An errored run is a FAILED run, not a completed one — failed runs
           // receive no unread badge, no queue drain, and no notification.
